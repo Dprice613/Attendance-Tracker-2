@@ -1,0 +1,198 @@
+from flask import Flask, request, jsonify, render_template
+from flask_sqlalchemy import SQLAlchemy
+from flask_socketio import SocketIO, emit
+import datetime
+import os
+
+# Initialize Flask app and extensions
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///attendance.db'
+app.config['SECRET_KEY'] = 'your_secret_key'
+db = SQLAlchemy(app)
+
+# Initialize SocketIO with SSL disabled
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', logger=True, engineio_logger=True)
+
+# Database Models
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50), nullable=False)
+    role = db.Column(db.String(20), nullable=False)  # 'student' or 'teacher'
+
+class Attendance(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    date = db.Column(db.Date, default=datetime.date.today, nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.datetime.utcnow, nullable=False)
+
+class Badge(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50), nullable=False)
+    description = db.Column(db.String(255))
+
+class UserBadge(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    badge_id = db.Column(db.Integer, db.ForeignKey('badge.id'), nullable=False)
+    awarded_date = db.Column(db.DateTime, default=datetime.datetime.utcnow, nullable=False)
+
+# Routes
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/mark_attendance', methods=['POST'])
+def mark_attendance():
+    data = request.json
+    if not data or 'user_id' not in data:
+        return jsonify({'error': 'Invalid data'}), 400
+
+    user_id = data.get('user_id')
+    user = User.query.get(user_id)
+
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    attendance = Attendance(user_id=user_id)
+    db.session.add(attendance)
+    db.session.commit()
+
+    # Emit real-time update
+    socketio.emit('attendance_update', {'user_id': user_id, 'name': user.name, 'timestamp': attendance.timestamp.isoformat()})
+
+    return jsonify({'message': 'Attendance marked successfully'}), 200
+
+@app.route('/teacher_dashboard', methods=['GET'])
+def teacher_dashboard():
+    users = User.query.filter_by(role='student').all()
+    attendance_records = Attendance.query.all()
+
+    attendance_summary = {}
+    for user in users:
+        attendance_summary[user.name] = len([record for record in attendance_records if record.user_id == user.id])
+
+    return jsonify({'attendance_summary': attendance_summary}), 200
+
+@app.route('/add_badge', methods=['POST'])
+def add_badge():
+    data = request.json
+    if not data or 'name' not in data or 'description' not in data:
+        return jsonify({'error': 'Invalid data'}), 400
+
+    name = data.get('name')
+    description = data.get('description')
+
+    badge = Badge(name=name, description=description)
+    db.session.add(badge)
+    db.session.commit()
+
+    return jsonify({'message': 'Badge added successfully', 'badge_id': badge.id}), 201
+
+@app.route('/award_badge', methods=['POST'])
+def award_badge():
+    data = request.json
+    if not data or 'user_id' not in data or 'badge_id' not in data:
+        return jsonify({'error': 'Invalid data'}), 400
+
+    user_id = data.get('user_id')
+    badge_id = data.get('badge_id')
+
+    user = User.query.get(user_id)
+    badge = Badge.query.get(badge_id)
+
+    if not user or not badge:
+        return jsonify({'error': 'User or badge not found'}), 404
+
+    user_badge = UserBadge(user_id=user_id, badge_id=badge_id)
+    db.session.add(user_badge)
+    db.session.commit()
+
+    # Emit real-time badge notification
+    socketio.emit('badge_awarded', {'user_id': user_id, 'badge_name': badge.name, 'awarded_date': user_badge.awarded_date.isoformat()})
+
+    return jsonify({'message': 'Badge awarded successfully'}), 200
+
+@app.route('/users', methods=['GET'])
+def get_users():
+    users = User.query.all()
+    result = [{'id': user.id, 'name': user.name, 'role': user.role} for user in users]
+    return jsonify(result), 200
+
+@app.route('/create_user', methods=['POST'])
+def create_user():
+    data = request.json
+    if not data or 'name' not in data or 'role' not in data:
+        return jsonify({'error': 'Invalid data'}), 400
+
+    name = data.get('name')
+    role = data.get('role')
+
+    user = User(name=name, role=role)
+    db.session.add(user)
+    db.session.commit()
+
+    return jsonify({'message': 'User created successfully', 'user_id': user.id}), 201
+
+@app.route('/badges', methods=['GET'])
+def get_badges():
+    badges = Badge.query.all()
+    result = [{'id': badge.id, 'name': badge.name, 'description': badge.description} for badge in badges]
+    return jsonify(result), 200
+
+@app.route('/attendance', methods=['GET'])
+def get_attendance():
+    attendance_records = Attendance.query.all()
+    result = [{'id': record.id, 'user_id': record.user_id, 'date': record.date.isoformat(), 'timestamp': record.timestamp.isoformat()} for record in attendance_records]
+    return jsonify(result), 200
+
+# Ensure templates folder exists
+if not os.path.exists('templates'):
+    os.makedirs('templates')
+
+# Create index.html template
+html_content = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Attendance Tracker</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.5.4/socket.io.min.js"></script>
+    <script>
+        const socket = io();
+
+        socket.on('attendance_update', function(data) {
+            const log = document.getElementById('attendance-log');
+            const entry = document.createElement('li');
+            entry.textContent = `Attendance marked for ${data.name} at ${data.timestamp}`;
+            log.appendChild(entry);
+        });
+
+        socket.on('badge_awarded', function(data) {
+            const log = document.getElementById('badge-log');
+            const entry = document.createElement('li');
+            entry.textContent = `Badge '${data.badge_name}' awarded to user ${data.user_id} on ${data.awarded_date}`;
+            log.appendChild(entry);
+        });
+    </script>
+</head>
+<body>
+    <h1>Attendance Tracker</h1>
+    <h2>Real-Time Logs</h2>
+    <h3>Attendance</h3>
+    <ul id="attendance-log"></ul>
+
+    <h3>Badges</h3>
+    <ul id="badge-log"></ul>
+</body>
+</html>
+"""
+
+with open('templates/index.html', 'w') as f:
+    f.write(html_content)
+
+# Main Entry Point
+if __name__ == '__main__':
+    db.create_all()  # Ensure all database tables are created
+    print("Starting the attendance tracker system...")
+    socketio.run(app, debug=True, host='0.0.0.0', port=5000)
